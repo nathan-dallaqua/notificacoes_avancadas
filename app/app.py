@@ -85,18 +85,17 @@ def enviar_notificacao():
 def consultar_status(trace_id):
     try:
         trace_uuid = UUID(trace_id)
-        
         if trace_uuid not in notificacoes_status:
             return jsonify({'error': 'Notificação não encontrada'}), 404
         
         dados = notificacoes_status[trace_uuid]
         return jsonify({
-            'traceId': str(dados['traceId']),
-            'mensagemId': str(dados['mensagemId']),
-            'conteudoMensagem': dados['conteudoMensagem'],
-            'tipoNotificacao': dados['tipoNotificacao'],
-            'status': dados['status'],
-            'historico': dados['historico']
+            'traceId': str(dados.get('traceId')),
+            'mensagemId': str(dados.get('mensagemId')),
+            'conteudoMensagem': dados.get('conteudoMensagem'),
+            'tipoNotificacao': dados.get('tipoNotificacao'),
+            'status': dados.get('status'),
+            'historico': dados.get('historico')
         })
         
     except ValueError:

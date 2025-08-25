@@ -57,3 +57,6 @@ python -m app.app
 # Executar Testes
 pytest app/test_publisher.py
 
+# Testes de Cobertura
+pytest --cov=app --cov-report=html app/test_publisher.py
+

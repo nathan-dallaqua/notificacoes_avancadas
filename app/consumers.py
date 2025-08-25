@@ -119,7 +119,6 @@ def processador_retry():
             def callback(ch, method, properties, body):
                 try:
                     time.sleep(3)
-                    
                     dados = json.loads(body.decode())
                     trace_id = UUID(dados["traceId"])
                     
@@ -179,7 +178,6 @@ def processador_validacao():
     while True:
         try:
             connection, channel = criar_conexao_segura("validacao")
-            
             channel.queue_declare(queue='fila.notificacao.validacao.NATHAN', durable=True)
             
             def callback(ch, method, properties, body):
@@ -187,11 +185,13 @@ def processador_validacao():
                     dados = json.loads(body.decode())
                     trace_id = UUID(dados["traceId"])
                     tipo = dados["tipoNotificacao"]
-                    
+                
                     if tipo == "EMAIL":
                         time.sleep(random.uniform(0.5, 1.0))
+
                     elif tipo == "SMS":
                         time.sleep(random.uniform(0.3, 0.7))
+                        
                     else:
                         time.sleep(random.uniform(0.2, 0.5))
                    
