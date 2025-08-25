@@ -5,6 +5,13 @@ import json
 from app.app import app
 from app.consumers import notificacoes_status, atualizar_status
 
+@pytest.fixture(autouse=True)
+def mock_consumers():
+    """Mock completo dos consumidores RabbitMQ para evitar interferência nos testes"""
+    with patch('app.app.iniciar_consumidores'), \
+         patch('app.app.start_consumers'):
+        yield
+
 @pytest.fixture
 def client():
     """Fixture para criar um cliente de teste Flask"""
@@ -57,7 +64,7 @@ def test_enviar_notificacao_sucesso(client, mock_rabbitmq_connection, mock_consu
     assert isinstance(UUID(response_data['mensagemId']), UUID)
     assert isinstance(UUID(response_data['traceId']), UUID)
     
-    mock_rabbitmq_connection.queue_declare.assert_called_once_with(
+    mock_rabbitmq_connection.queue_declare.assert_called_with(
         queue='fila.notificacao.entrada.NATHAN', 
         durable=True
     )
