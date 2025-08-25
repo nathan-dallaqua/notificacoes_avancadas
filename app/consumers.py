@@ -2,11 +2,13 @@ import json
 import random
 import time
 import threading
+import logging
 from uuid import UUID
 from pika import BasicProperties
 from .rabbitmq import RabbitMQConnection
 
-# Estrutura em memória para armazenar status
+logger = logging.getLogger(__name__)
+
 notificacoes_status = {}
 notificacoes_lock = threading.Lock()
 
@@ -25,230 +27,257 @@ def atualizar_status(traceId, status, dados):
             notificacoes_status[traceId]["status"] = status
             notificacoes_status[traceId]["historico"].append(status)
 
+def criar_conexao_segura(nome):
+    """Cria uma conexão com tratamento de erros"""
+    max_tentativas = 5
+    tentativa = 0
+    
+    while tentativa < max_tentativas:
+        try:
+            connection = RabbitMQConnection.get_connection(nome)
+            channel = connection.channel()
+            return connection, channel
+        except Exception as e:
+            tentativa += 1
+            logger.warning(f"Tentativa {tentativa}/{max_tentativas} para conexão '{nome}' falhou: {e}")
+            time.sleep(2 ** tentativa)
+    
+    raise Exception(f"Não foi possível estabelecer conexão '{nome}' após {max_tentativas} tentativas")
+
 def processador_entrada():
-    """Processador principal com sua própria conexão"""
-    try:
-        connection = RabbitMQConnection.get_connection("entrada")
-        channel = connection.channel()
-        
-        # Declarar a fila
-        channel.queue_declare(queue='fila.notificacao.entrada.ROBSON', durable=True)
-        
-        def callback(ch, method, properties, body):
+    """Processador principal com reconexão robusta"""
+    while True:
+        try:
+            connection, channel = criar_conexao_segura("entrada")
+            channel.queue_declare(queue='fila.notificacao.entrada.NATHAN', durable=True)
+            
+            def callback(ch, method, properties, body):
+                try:
+                    dados = json.loads(body.decode())
+                    trace_id = UUID(dados["traceId"])
+                    
+                    if random.random() < 0.12:
+                        atualizar_status(trace_id, "FALHA_PROCESSAMENTO_INICIAL", dados)
+                        retry_conn, retry_channel = criar_conexao_segura("retry_pub")
+                        retry_channel.queue_declare(queue='fila.notificacao.retry.NATHAN', durable=True)
+                        retry_channel.basic_publish(
+                            exchange='',
+                            routing_key='fila.notificacao.retry.NATHAN',
+                            body=json.dumps(dados),
+                            properties=BasicProperties(delivery_mode=2)
+                        )
+                        retry_conn.close()
+                        
+                    else:
+                        time.sleep(random.uniform(1, 1.5))
+                        atualizar_status(trace_id, "PROCESSADO_INTERMEDIARIO", dados)
+                        
+                        validacao_conn, validacao_channel = criar_conexao_segura("validacao_pub")
+                        validacao_channel.queue_declare(queue='fila.notificacao.validacao.NATHAN', durable=True)
+                        validacao_channel.basic_publish(
+                            exchange='',
+                            routing_key='fila.notificacao.validacao.NATHAN',
+                            body=json.dumps(dados),
+                            properties=BasicProperties(delivery_mode=2)
+                        )
+                        validacao_conn.close()
+                        
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    
+                except Exception as e:
+                    logger.error(f"Erro no processamento da mensagem: {e}")
+                    try:
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    except:
+                        pass
+            
+            channel.basic_consume(
+                queue='fila.notificacao.entrada.NATHAN',
+                on_message_callback=callback,
+                auto_ack=False
+            )
+            
+            logger.info("Processador de entrada iniciado e consumindo")
+            channel.start_consuming()
+            
+        except Exception as e:
+            logger.error(f"Erro fatal no processador de entrada: {e}")
+            time.sleep(5)
             try:
-                dados = json.loads(body.decode())
-                trace_id = UUID(dados["traceId"])
-                
-                # Simular falha aleatória (10-15% de chance)
-                if random.random() < 0.12:
-                    atualizar_status(trace_id, "FALHA_PROCESSAMENTO_INICIAL", dados)
-                    
-                    # Publicar na fila de retry
-                    retry_connection = RabbitMQConnection.get_connection("retry_pub")
-                    retry_channel = retry_connection.channel()
-                    retry_channel.queue_declare(queue='fila.notificacao.retry.ROBSON', durable=True)
-                    
-                    retry_channel.basic_publish(
-                        exchange='',
-                        routing_key='fila.notificacao.retry.ROBSON',
-                        body=json.dumps(dados),
-                        properties=BasicProperties(delivery_mode=2)
-                    )
-                    
-                else:
-                    # Simular processamento
-                    time.sleep(random.uniform(1, 1.5))
-                    atualizar_status(trace_id, "PROCESSADO_INTERMEDIARIO", dados)
-                    
-                    # Publicar na fila de validação
-                    validacao_connection = RabbitMQConnection.get_connection("validacao_pub")
-                    validacao_channel = validacao_connection.channel()
-                    validacao_channel.queue_declare(queue='fila.notificacao.validacao.ROBSON', durable=True)
-                    
-                    validacao_channel.basic_publish(
-                        exchange='',
-                        routing_key='fila.notificacao.validacao.ROBSON',
-                        body=json.dumps(dados),
-                        properties=BasicProperties(delivery_mode=2)
-                    )
-                    
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                
-            except Exception as e:
-                print(f"Erro no processador de entrada: {e}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        
-        channel.basic_consume(
-            queue='fila.notificacao.entrada.ROBSON',
-            on_message_callback=callback,
-            auto_ack=False
-        )
-        
-        print("Processador de entrada iniciado")
-        channel.start_consuming()
-        
-    except Exception as e:
-        print(f"Erro fatal no processador de entrada: {e}")
-        time.sleep(5)  # Esperar antes de tentar reconectar
-        processador_entrada()  # Reiniciar
+                RabbitMQConnection.close_connection("entrada")
+            except:
+                pass
 
 def processador_retry():
-    """Processador de retry com sua própria conexão"""
-    try:
-        connection = RabbitMQConnection.get_connection("retry")
-        channel = connection.channel()
-        
-        channel.queue_declare(queue='fila.notificacao.retry.ROBSON', durable=True)
-        
-        def callback(ch, method, properties, body):
+    """Processador de retry com reconexão robusta"""
+    while True:
+        try:
+            connection, channel = criar_conexao_segura("retry")
+            
+            channel.queue_declare(queue='fila.notificacao.retry.NATHAN', durable=True)
+            
+            def callback(ch, method, properties, body):
+                try:
+                    time.sleep(3)
+                    
+                    dados = json.loads(body.decode())
+                    trace_id = UUID(dados["traceId"])
+                    
+                    if random.random() < 0.2:
+                        atualizar_status(trace_id, "FALHA_FINAL_REPROCESSAMENTO", dados)
+                        dlq_conn, dlq_channel = criar_conexao_segura("dlq_pub")
+                        dlq_channel.queue_declare(queue='fila.notificacao.dlq.NATHAN', durable=True)
+                        dlq_channel.basic_publish(
+                            exchange='',
+                            routing_key='fila.notificacao.dlq.NATHAN',
+                            body=json.dumps(dados),
+                            properties=BasicProperties(delivery_mode=2)
+                        )
+                        dlq_conn.close()
+                        
+                    else:
+                        atualizar_status(trace_id, "REPROCESSADO_COM_SUCESSO", dados)
+                        
+                        validacao_conn, validacao_channel = criar_conexao_segura("validacao_pub2")
+                        validacao_channel.queue_declare(queue='fila.notificacao.validacao.NATHAN', durable=True)
+                        validacao_channel.basic_publish(
+                            exchange='',
+                            routing_key='fila.notificacao.validacao.NATHAN',
+                            body=json.dumps(dados),
+                            properties=BasicProperties(delivery_mode=2)
+                        )
+                        validacao_conn.close()
+                        
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    
+                except Exception as e:
+                    logger.error(f"Erro no processamento de retry: {e}")
+                    try:
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    except:
+                        pass
+            
+            channel.basic_consume(
+                queue='fila.notificacao.retry.NATHAN',
+                on_message_callback=callback,
+                auto_ack=False
+            )
+            
+            logger.info("Processador de retry iniciado e consumindo")
+            channel.start_consuming()
+            
+        except Exception as e:
+            logger.error(f"Erro fatal no processador de retry: {e}")
+            time.sleep(5)
             try:
-                time.sleep(3)  # Atraso antes do reprocessamento
-                
-                dados = json.loads(body.decode())
-                trace_id = UUID(dados["traceId"])
-                
-                # Nova chance de falha (20%)
-                if random.random() < 0.2:
-                    atualizar_status(trace_id, "FALHA_FINAL_REPROCESSAMENTO", dados)
-                    
-                    # Publicar na DLQ
-                    dlq_connection = RabbitMQConnection.get_connection("dlq_pub")
-                    dlq_channel = dlq_connection.channel()
-                    dlq_channel.queue_declare(queue='fila.notificacao.dlq.ROBSON', durable=True)
-                    
-                    dlq_channel.basic_publish(
-                        exchange='',
-                        routing_key='fila.notificacao.dlq.ROBSON',
-                        body=json.dumps(dados),
-                        properties=BasicProperties(delivery_mode=2)
-                    )
-                    
-                else:
-                    atualizar_status(trace_id, "REPROCESSADO_COM_SUCESSO", dados)
-                    
-                    # Publicar na fila de validação
-                    validacao_connection = RabbitMQConnection.get_connection("validacao_pub2")
-                    validacao_channel = validacao_connection.channel()
-                    validacao_channel.queue_declare(queue='fila.notificacao.validacao.ROBSON', durable=True)
-                    
-                    validacao_channel.basic_publish(
-                        exchange='',
-                        routing_key='fila.notificacao.validacao.ROBSON',
-                        body=json.dumps(dados),
-                        properties=BasicProperties(delivery_mode=2)
-                    )
-                    
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                
-            except Exception as e:
-                print(f"Erro no processador de retry: {e}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        
-        channel.basic_consume(
-            queue='fila.notificacao.retry.ROBSON',
-            on_message_callback=callback,
-            auto_ack=False
-        )
-        
-        print("Processador de retry iniciado")
-        channel.start_consuming()
-        
-    except Exception as e:
-        print(f"Erro fatal no processador de retry: {e}")
-        time.sleep(5)
-        processador_retry()
+                RabbitMQConnection.close_connection("retry")
+            except:
+                pass
 
 def processador_validacao():
-    """Processador de validação com sua própria conexão"""
-    try:
-        connection = RabbitMQConnection.get_connection("validacao")
-        channel = connection.channel()
-        
-        channel.queue_declare(queue='fila.notificacao.validacao.ROBSON', durable=True)
-        
-        def callback(ch, method, properties, body):
+    """Processador de validação com reconexão robusta"""
+    while True:
+        try:
+            connection, channel = criar_conexao_segura("validacao")
+            
+            channel.queue_declare(queue='fila.notificacao.validacao.NATHAN', durable=True)
+            
+            def callback(ch, method, properties, body):
+                try:
+                    dados = json.loads(body.decode())
+                    trace_id = UUID(dados["traceId"])
+                    tipo = dados["tipoNotificacao"]
+                    
+                    if tipo == "EMAIL":
+                        time.sleep(random.uniform(0.5, 1.0))
+                    elif tipo == "SMS":
+                        time.sleep(random.uniform(0.3, 0.7))
+                    else:
+                        time.sleep(random.uniform(0.2, 0.5))
+                   
+                    if random.random() < 0.05:
+                        atualizar_status(trace_id, "FALHA_ENVIO_FINAL", dados)
+                        dlq_conn, dlq_channel = criar_conexao_segura("dlq_pub2")
+                        dlq_channel.queue_declare(queue='fila.notificacao.dlq.NATHAN', durable=True)
+                        dlq_channel.basic_publish(
+                            exchange='',
+                            routing_key='fila.notificacao.dlq.NATHAN',
+                            body=json.dumps(dados),
+                            properties=BasicProperties(delivery_mode=2)
+                        )
+                        dlq_conn.close()
+                        
+                    else:
+                        atualizar_status(trace_id, "ENVIADO_SUCESSO", dados)
+                        
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    
+                except Exception as e:
+                    logger.error(f"Erro no processamento de validação: {e}")
+                    try:
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    except:
+                        pass
+            
+            channel.basic_consume(
+                queue='fila.notificacao.validacao.NATHAN',
+                on_message_callback=callback,
+                auto_ack=False
+            )
+            
+            logger.info("Processador de validação iniciado e consumindo")
+            channel.start_consuming()
+            
+        except Exception as e:
+            logger.error(f"Erro fatal no processador de validação: {e}")
+            time.sleep(5)
             try:
-                dados = json.loads(body.decode())
-                trace_id = UUID(dados["traceId"])
-                tipo = dados["tipoNotificacao"]
-                
-                if tipo == "EMAIL":
-                    time.sleep(random.uniform(0.5, 1.0))
-                elif tipo == "SMS":
-                    time.sleep(random.uniform(0.3, 0.7))
-                else:
-                    time.sleep(random.uniform(0.2, 0.5))
-                
-                if random.random() < 0.05:
-                    atualizar_status(trace_id, "FALHA_ENVIO_FINAL", dados)
-                    
-                    dlq_connection = RabbitMQConnection.get_connection("dlq_pub2")
-                    dlq_channel = dlq_connection.channel()
-                    dlq_channel.queue_declare(queue='fila.notificacao.dlq.ROBSON', durable=True)
-                    
-                    dlq_channel.basic_publish(
-                        exchange='',
-                        routing_key='fila.notificacao.dlq.ROBSON',
-                        body=json.dumps(dados),
-                        properties=BasicProperties(delivery_mode=2)
-                    )
-                    
-                else:
-                    atualizar_status(trace_id, "ENVIADO_SUCESSO", dados)
-                    
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                
-            except Exception as e:
-                print(f"Erro no processador de validação: {e}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        
-        channel.basic_consume(
-            queue='fila.notificacao.validacao.ROBSON',
-            on_message_callback=callback,
-            auto_ack=False
-        )
-        
-        print("Processador de validação iniciado")
-        channel.start_consuming()
-        
-    except Exception as e:
-        print(f"Erro fatal no processador de validação: {e}")
-        time.sleep(5)
-        processador_validacao()
+                RabbitMQConnection.close_connection("validacao")
+            except:
+                pass
 
 def processador_dlq():
-    try:
-        connection = RabbitMQConnection.get_connection("dlq")
-        channel = connection.channel()
-        channel.queue_declare(queue='fila.notificacao.dlq.ROBSON', durable=True)
-        
-        def callback(ch, method, properties, body):
+    """Processador DLQ com reconexão robusta"""
+    while True:
+        try:
+            connection, channel = criar_conexao_segura("dlq")
+            
+            channel.queue_declare(queue='fila.notificacao.dlq.NATHAN', durable=True)
+            
+            def callback(ch, method, properties, body):
+                try:
+                    dados = json.loads(body.decode())
+                    trace_id = UUID(dados["traceId"])
+                    logger.info(f"Mensagem com traceId {trace_id} enviada para DLQ e não será mais processada")
+                    
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    
+                except Exception as e:
+                    logger.error(f"Erro no processamento DLQ: {e}")
+                    try:
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    except:
+                        pass
+            
+            channel.basic_consume(
+                queue='fila.notificacao.dlq.NATHAN',
+                on_message_callback=callback,
+                auto_ack=False
+            )
+            
+            logger.info("Processador DLQ iniciado e consumindo")
+            channel.start_consuming()
+            
+        except Exception as e:
+            logger.error(f"Erro fatal no processador DLQ: {e}")
+            time.sleep(5)
             try:
-                dados = json.loads(body.decode())
-                trace_id = UUID(dados["traceId"])
-                print(f"Mensagem com traceId {trace_id} enviada para DLQ e não será mais processada")
-                
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                
-            except Exception as e:
-                print(f"Erro no processador DLQ: {e}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        
-        channel.basic_consume(
-            queue='fila.notificacao.dlq.ROBSON',
-            on_message_callback=callback,
-            auto_ack=False
-        )
-        
-        print("Processador DLQ iniciado")
-        channel.start_consuming()
-        
-    except Exception as e:
-        print(f"Erro fatal no processador DLQ: {e}")
-        time.sleep(5)
-        processador_dlq()
+                RabbitMQConnection.close_connection("dlq")
+            except:
+                pass
 
 def iniciar_consumidores():
+    """Iniciar todos os consumidores em threads separadas"""
     threads = []
     consumers = [
         ("Entrada", processador_entrada),
@@ -265,9 +294,9 @@ def iniciar_consumidores():
         )
         thread.start()
         threads.append(thread)
-        time.sleep(1)
+        time.sleep(2)
     
-    print("Todos os consumidores iniciados")
+    logger.info("Todos os consumidores iniciados")
     
     while True:
         time.sleep(1)

@@ -55,16 +55,23 @@ def enviar_notificacao():
             "conteudoMensagem": conteudo_mensagem,
             "tipoNotificacao": tipo_notificacao
         }
+
+        try:
+            connection = RabbitMQConnection.get_connection("publisher")
+            channel = connection.channel()
+            channel.queue_declare(queue='fila.notificacao.entrada.NATHAN', durable=True)
+            channel.basic_publish(
+                exchange='',
+                routing_key='fila.notificacao.entrada.NATHAN',
+                body=json.dumps(dados),
+                properties=BasicProperties(delivery_mode=2)
+            )
+            
+            connection.close()
+            
+        except Exception as e:
+            return jsonify({'error': 'Erro interno ao processar notificação'}), 500
         
-        connection = RabbitMQConnection.get_connection("publisher")
-        channel = connection.channel()
-        channel.queue_declare(queue='fila.notificacao.entrada.ROBSON', durable=True)
-        channel.basic_publish(
-            exchange='',
-            routing_key='fila.notificacao.entrada.ROBSON',
-            body=json.dumps(dados),
-            properties=BasicProperties(delivery_mode=2)
-        )
         
         return jsonify({
             'mensagemId': str(mensagem_id),
