@@ -39,9 +39,6 @@ Sistema de notificações assíncronas construído com Python, Flask e RabbitMQ,
 ### Instalação
 
 ```bash
-# Clone o repositório
-git clone <url-do-repositorio>
-cd notificacoes_avancadas
 
 # Crie um ambiente virtual
 python -m venv venv
